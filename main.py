@@ -1,16 +1,18 @@
-# This is a sample Python script.
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters.command import Command
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
+logging.basicConfig(level=logging.INFO)
+TOKEN = "6713953154:AAECYRfZxOQYAbMJOsrKsApbulPDKTc3hI4"
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Hello!")
+async def main():
+    await dp.start_polling(bot)
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+F8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+    asyncio.run(main())
