@@ -16,3 +16,7 @@ class LLMAuth(StatesGroup):
 
 class WatchlistConfig(StatesGroup):
     waiting_for_symbol = State()
+
+class PaperTopUp(StatesGroup):
+    waiting_for_asset = State()
+    waiting_for_amount = State()

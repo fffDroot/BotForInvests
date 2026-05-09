@@ -46,6 +46,7 @@ class LLMAPIKey(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     provider_name = Column(String) # openai, anthropic, deepseek, groq, gemini, etc.
     api_key = Column(String)
+    assigned_role = Column(String, default="general") # general, fundamental, technical, risk
     is_active = Column(Boolean, default=True)
 
     user = relationship("User", back_populates="llm_keys")
@@ -86,6 +87,12 @@ class TradingSettings(Base):
 
     # AI and Council Settings
     use_llm_council = Column(Boolean, default=False)
+    council_mode = Column(String, default="classic") # classic, role_based
+
+    # Smart Features
+    smart_alerts_enabled = Column(Boolean, default=True)
+    whale_tracking_enabled = Column(Boolean, default=False)
+    auto_averaging_enabled = Column(Boolean, default=False)
 
     user = relationship("User", back_populates="settings")
 

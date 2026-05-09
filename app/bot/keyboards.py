@@ -24,6 +24,7 @@ def get_settings_menu(trade_mode: str = "advisory", account_type: str = "paper")
             [InlineKeyboardButton(text=trade_text, callback_data="toggle_trade_mode"),
              InlineKeyboardButton(text=account_text, callback_data="toggle_account_type")],
             [InlineKeyboardButton(text="📋 Мой Watchlist", callback_data="manage_watchlist")],
+            [InlineKeyboardButton(text="💰 Пополнить Виртуальный счет", callback_data="top_up_paper")],
             [InlineKeyboardButton(text="🔙 Закрыть настройки", callback_data="close_settings")]
         ]
     )

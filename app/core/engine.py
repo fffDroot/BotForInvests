@@ -41,23 +41,36 @@ class TradingEngine:
             for settings in active_settings_list:
                 await self._process_user(session, settings)
 
-    async def _get_global_sentiment(self, session, user: User, settings: TradingSettings) -> str:
-        """Returns 'positive', 'neutral', or 'negative' based on News/LLM Council"""
+    async def _get_global_sentiment(self, session, user: User, settings: TradingSettings) -> dict:
+        """Returns full dict with sentiment and reasoning based on News/LLM Council"""
         analyzer = NewsAnalyzer()
         news = analyzer.fetch_latest_news(limit=10)
 
         if settings.use_llm_council:
             llm_keys = await session.execute(select(LLMAPIKey).where(LLMAPIKey.user_id == user.id))
-            keys_list = [{"provider": k.provider_name, "key": k.api_key} for k in llm_keys.scalars().all()]
+            keys_list = [{"provider": k.provider_name, "key": k.api_key, "role": k.assigned_role} for k in llm_keys.scalars().all()]
             if keys_list:
-                council = LLMCouncil(keys_list)
+                council = LLMCouncil(keys_list, council_mode=settings.council_mode)
+
                 news_text = "\n".join(news)
+
+                # Inject Fear and Greed and Macro Calendar
+                fg_index = await analyzer.get_fear_and_greed_index()
+                macro_cal = await analyzer.get_macro_calendar()
+                news_text += f"\n\nМакро индикаторы и Календарь:\n- {fg_index}\n- {macro_cal}"
+
+                # Inject whale data if enabled
+                if settings.whale_tracking_enabled:
+                    from app.strategies.onchain import OnChainAnalyzer
+                    whale_data = await OnChainAnalyzer().get_whale_activity_summary()
+                    news_text += f"\n\n{whale_data}"
+
                 decision = await council.get_council_decision(news_text)
-                return decision.get('sentiment', 'neutral')
+                return decision
 
         # Fallback to baseline
         baseline = analyzer.analyze_sentiment(news)
-        return baseline.get('label', 'neutral')
+        return {'sentiment': baseline.get('label', 'neutral'), 'reasoning': baseline.get('summary', '')}
 
     async def _process_user(self, session, settings: TradingSettings):
         user = await session.scalar(select(User).where(User.id == settings.user_id))
@@ -67,16 +80,17 @@ class TradingEngine:
         if not api_keys:
             return # No keys to trade with
 
-        # Get global sentiment once per user cycle
-        global_sentiment = await self._get_global_sentiment(session, user, settings)
+        # Get global sentiment dict once per user cycle
+        global_sentiment_dict = await self._get_global_sentiment(session, user, settings)
 
         for api_key_info in api_keys:
             try:
-                await self._trade_on_exchange(session, user, settings, api_key_info, global_sentiment)
+                await self._trade_on_exchange(session, user, settings, api_key_info, global_sentiment_dict)
             except Exception as e:
                 logger.error(f"Error trading for user {user.id} on {api_key_info.exchange_name}: {e}")
 
-    async def _trade_on_exchange(self, session, user: User, settings: TradingSettings, api_key_info: ExchangeAPIKey, global_sentiment: str):
+    async def _trade_on_exchange(self, session, user: User, settings: TradingSettings, api_key_info: ExchangeAPIKey, global_sentiment_dict: dict):
+        global_sentiment = global_sentiment_dict.get('sentiment', 'neutral')
         if settings.account_type == "paper":
             exchange = PaperTradingExchangeWrapper(user_id=user.id, mock_exchange_name=api_key_info.exchange_name)
         else:
@@ -179,16 +193,30 @@ class TradingEngine:
             if not signal:
                 signal = strategy.generate_signal(df, current_position)
 
-            if signal and signal['action'] == 'buy' and global_sentiment == 'negative':
-                logger.info(f"Skipping BUY for {user.id} on {symbol} due to negative global sentiment.")
-                signal = None
+            # Orderbook and Funding Analysis
+            scanner = MarketScanner(api_key_info.exchange_name if api_key_info.exchange_name != 'paper' else 'binance')
+            ob_funding = await scanner.get_orderbook_and_funding(symbol)
 
-            if current_position > 0 and global_sentiment == 'negative' and not signal:
-                logger.info(f"Generating panic SELL for {user.id} on {symbol} due to negative global sentiment.")
-                signal = {'action': 'sell', 'reason': 'Global negative sentiment (Panic Sell)', 'size_pct': 100.0}
+            if signal and signal['action'] == 'buy':
+                if global_sentiment == 'negative':
+                    logger.info(f"Skipping BUY for {user.id} on {symbol} due to negative global sentiment.")
+                    signal = None
+                elif ob_funding['orderbook_imbalance'] == 'bearish (strong sell wall)':
+                    logger.info(f"Skipping BUY for {user.id} on {symbol} due to strong sell wall.")
+                    signal = None
+
+            if current_position > 0 and not signal:
+                if global_sentiment == 'negative':
+                    logger.info(f"Generating panic SELL for {user.id} on {symbol} due to negative global sentiment.")
+                    signal = {'action': 'sell', 'reason': 'Global negative sentiment (Panic Sell)', 'size_pct': 100.0}
+                elif 'High - Squeeze Risk' in ob_funding['funding_rate']:
+                    logger.info(f"Generating risk SELL for {user.id} on {symbol} due to high funding.")
+                    signal = {'action': 'sell', 'reason': 'High Funding Rate (Long Squeeze Risk)', 'size_pct': 50.0}
 
             if signal:
-                if settings.trade_mode == "advisory":
+                if settings.trade_mode == "advisory" and settings.smart_alerts_enabled:
+                    await self._send_smart_alert(user, settings, exchange.__class__.__name__, symbol, signal, df, global_sentiment_dict)
+                elif settings.trade_mode == "advisory":
                     await self._send_advisory_signal(user, settings, exchange.__class__.__name__, symbol, signal, quote_balance, current_position)
                 else:
                     await self._execute_signal(session, user, settings, exchange, symbol, signal, current_position, quote_balance)
@@ -201,6 +229,45 @@ class TradingEngine:
 
         await exchange.close()
 
+
+    async def _send_smart_alert(self, user: User, settings: TradingSettings, exchange_name: str, symbol: str, signal: dict, df, global_sentiment_dict: dict):
+        action = signal['action']
+        size_pct = signal['size_pct'] / 100.0
+        current_price = df['close'].iloc[-1]
+
+        from app.strategies.analyzer import MarketAnalyzer
+        from app.strategies.scanner import MarketScanner
+
+        tech = MarketAnalyzer.get_comprehensive_technical_analysis(df)
+        scanner = MarketScanner(exchange_name if exchange_name != 'paper' else 'binance')
+        ob_funding = await scanner.get_orderbook_and_funding(symbol)
+
+        msg = f"🔔 **СМАРТ-СИГНАЛ: {'ПОКУПКА 🟢' if action == 'buy' else 'ПРОДАЖА 🔴'}**\n\n" \
+              f"**Анализ {symbol} ({exchange_name})**\n" \
+              f"Текущая цена: {current_price:.4f}\n\n" \
+              f"**Обоснование ИИ:**\n" \
+              f"Причина: {signal.get('reason', '')}\n" \
+              f"Глобальный фон: {global_sentiment_dict.get('sentiment', 'neutral').upper()}\n" \
+              f"Детали: {global_sentiment_dict.get('reasoning', '')[:200]}...\n\n" \
+              f"**Техника и Стакан:**\n" \
+              f"• RSI: {tech.get('rsi', 0):.1f} ({tech.get('rsi_signal', 'N/A')})\n" \
+              f"• Стакан: {ob_funding.get('orderbook_imbalance', 'N/A')}\n" \
+              f"• Фандинг: {ob_funding.get('funding_rate', 'N/A')}\n" \
+              f"• MACD: {tech.get('macd_signal', 'N/A')}\n" \
+              f"• Bollinger: {tech.get('bb_signal', 'N/A')}\n\n" \
+              f"**Счет:** {'Виртуальный (Paper)' if settings.account_type == 'paper' else 'Реальный'}\n" \
+              f"Объем: {size_pct*100}% от доступного баланса\n\n" \
+              f"Выполнить операцию?"
+
+        try:
+            await bot.send_message(
+                user.telegram_id,
+                msg,
+                parse_mode="Markdown",
+                reply_markup=get_advisory_approval_menu(symbol, action, size_pct)
+            )
+        except Exception as e:
+            logger.error(f"Failed to send smart alert: {e}")
 
     async def _send_advisory_signal(self, user: User, settings: TradingSettings, exchange_name: str, symbol: str, signal: dict, quote_balance: float, current_position: float):
         action = signal['action']

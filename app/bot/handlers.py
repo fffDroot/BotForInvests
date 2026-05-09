@@ -6,9 +6,9 @@ from sqlalchemy import select
 import json
 
 from .keyboards import get_main_menu, get_settings_menu, get_exchange_menu, get_strategies_menu, get_ai_menu
-from .states import ExchangeAuth, StrategyConfig, LLMAuth, WatchlistConfig
+from .states import ExchangeAuth, StrategyConfig, LLMAuth, WatchlistConfig, PaperTopUp
 from app.db.database import AsyncSessionLocal
-from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory, LLMAPIKey, Watchlist
+from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory, LLMAPIKey, Watchlist, PaperWallet
 from app.strategies.news import NewsAnalyzer
 from app.strategies.llm_council import LLMCouncil
 
@@ -89,6 +89,44 @@ async def process_watchlist_symbol(message: Message, state: FSMContext):
         await session.commit()
 
     await message.answer(action_text)
+    await state.clear()
+
+@router.callback_query(F.data == "top_up_paper")
+async def top_up_paper_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите актив, который хотите пополнить (например, USDT, RUB, BTC):")
+    await state.set_state(PaperTopUp.waiting_for_asset)
+
+@router.message(PaperTopUp.waiting_for_asset)
+async def top_up_paper_asset(message: Message, state: FSMContext):
+    asset = message.text.upper().strip()
+    await state.update_data(asset=asset)
+    await message.answer(f"Сколько {asset} добавить на счет?")
+    await state.set_state(PaperTopUp.waiting_for_amount)
+
+@router.message(PaperTopUp.waiting_for_amount)
+async def top_up_paper_amount(message: Message, state: FSMContext):
+    try:
+        amount = float(message.text)
+    except ValueError:
+        await message.answer("Пожалуйста, введите числовое значение.")
+        return
+
+    data = await state.get_data()
+    asset = data['asset']
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+        wallet = await session.scalar(select(PaperWallet).where(PaperWallet.user_id == user.id, PaperWallet.asset == asset))
+
+        if not wallet:
+            wallet = PaperWallet(user_id=user.id, asset=asset, balance=amount)
+            session.add(wallet)
+        else:
+            wallet.balance += amount
+
+        await session.commit()
+
+    await message.answer(f"✅ Баланс успешно пополнен: +{amount} {asset}")
     await state.clear()
 
 @router.callback_query(F.data == "close_settings")

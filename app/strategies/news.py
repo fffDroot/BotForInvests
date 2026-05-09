@@ -11,7 +11,8 @@ class NewsAnalyzer:
         self.rss_urls = [
             "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,BTC-USD",
             "https://cointelegraph.com/rss",
-            "https://www.cnbc.com/id/100003114/device/rss/rss.html" # CNBC Top News
+            "https://www.cnbc.com/id/100003114/device/rss/rss.html", # CNBC Top News
+            "https://www.investing.com/rss/news_25.rss" # Forex & Macro
         ]
 
     def fetch_latest_news(self, limit: int = 15) -> list:
@@ -59,6 +60,48 @@ class NewsAnalyzer:
             "summary": summary,
             "raw_news": text_list
         }
+
+    async def get_macro_calendar(self) -> str:
+        """
+        Simulates fetching the high-impact macro economic calendar (e.g. CPI, Fed rates).
+        In a real scenario, we would parse an API like ForexFactory or Investing.com.
+        """
+        import datetime
+        today = datetime.datetime.utcnow()
+        # Simulated logic: Every Wednesday we pretend there's an inflation report
+        if today.weekday() == 2:
+            return "⚠️ Сегодня выходит важный отчет по инфляции (CPI). Ожидается высокая волатильность."
+        elif today.weekday() == 3 and today.day < 8:
+            return "⚠️ Сегодня заседание ФРС (Изменение процентной ставки). Рынки в ожидании."
+        return "Важных макроэкономических событий сегодня не предвидится."
+
+    async def get_fear_and_greed_index(self) -> str:
+        """
+        Fetches the Crypto Fear and Greed Index.
+        """
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.alternative.me/fng/?limit=1") as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        val = data['data'][0]['value']
+                        classification = data['data'][0]['value_classification']
+                        return f"Индекс Страха и Жадности: {val} ({classification})"
+        except Exception as e:
+            logger.error(f"Error fetching Fear and Greed: {e}")
+        return "Индекс Страха и Жадности: Данные недоступны."
+
+    async def get_social_sentiment(self, symbol: str) -> str:
+        """
+        Simulates fetching sentiment from Twitter/Reddit/Telegram channels for a specific asset.
+        """
+        # In MVP, we return a simulated string. In production, this connects to LunarCrush or Twitter API.
+        if "BTC" in symbol or "ETH" in symbol:
+            return f"Социальные сети: Высокий уровень хайпа вокруг {symbol}. В Telegram каналах преобладает оптимизм (Bullish)."
+        elif "SBER" in symbol:
+            return f"Социальные сети: {symbol} активно обсуждается в российских инвест-чатах. Ожидание дивидендов."
+        return f"Социальные сети: Упоминаний {symbol} сегодня немного (Neutral)."
 
     def get_global_baseline_sentiment(self) -> dict:
         news = self.fetch_latest_news()
