@@ -13,3 +13,6 @@ class StrategyConfig(StatesGroup):
 class LLMAuth(StatesGroup):
     waiting_for_provider_name = State()
     waiting_for_api_key = State()
+
+class WatchlistConfig(StatesGroup):
+    waiting_for_symbol = State()

@@ -16,6 +16,28 @@ class User(Base):
     llm_keys = relationship("LLMAPIKey", back_populates="user", cascade="all, delete")
     settings = relationship("TradingSettings", back_populates="user", uselist=False, cascade="all, delete")
     trades = relationship("TradeHistory", back_populates="user", cascade="all, delete")
+    watchlist = relationship("Watchlist", back_populates="user", cascade="all, delete")
+    paper_wallet = relationship("PaperWallet", back_populates="user", cascade="all, delete")
+
+class Watchlist(Base):
+    __tablename__ = "watchlist"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    symbol = Column(String) # e.g., BTC/USDT, SBER
+    asset_type = Column(String) # crypto, stock
+
+    user = relationship("User", back_populates="watchlist")
+
+class PaperWallet(Base):
+    __tablename__ = "paper_wallets"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    asset = Column(String) # USDT, BTC, RUB
+    balance = Column(Float, default=0.0)
+
+    user = relationship("User", back_populates="paper_wallet")
 
 class LLMAPIKey(Base):
     __tablename__ = "llm_api_keys"
@@ -49,11 +71,15 @@ class TradingSettings(Base):
 
     is_trading_enabled = Column(Boolean, default=False)
     strategy_mode = Column(String, default="auto") # auto, grid, dca, trend
+    trade_mode = Column(String, default="advisory") # auto, advisory
+    account_type = Column(String, default="paper") # real, paper
 
     # Risk Management
     max_risk_per_trade_pct = Column(Float, default=1.0)
     global_stop_loss_pct = Column(Float, default=10.0)
     take_profit_pct = Column(Float, default=2.0)
+    use_trailing_stop = Column(Boolean, default=True)
+    trailing_stop_pct = Column(Float, default=3.0)
 
     # Optional JSON field for strategy specific settings (e.g. grid spacing)
     strategy_params = Column(JSON, nullable=True)

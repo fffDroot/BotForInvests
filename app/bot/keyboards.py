@@ -12,13 +12,30 @@ def get_main_menu():
     )
     return keyboard
 
-def get_settings_menu():
+def get_settings_menu(trade_mode: str = "advisory", account_type: str = "paper"):
+    trade_text = "Режим: Авто 🤖" if trade_mode == "auto" else "Режим: Советник 🙋‍♂️"
+    account_text = "Счет: Реальный 💳" if account_type == "real" else "Счет: Виртуальный 📄"
+
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔑 API ключи Бирж", callback_data="add_api_keys")],
             [InlineKeyboardButton(text="🛠 Стратегия и Риски", callback_data="config_strategy")],
             [InlineKeyboardButton(text="🧠 Настройки ИИ (LLM)", callback_data="config_ai")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
+            [InlineKeyboardButton(text=trade_text, callback_data="toggle_trade_mode"),
+             InlineKeyboardButton(text=account_text, callback_data="toggle_account_type")],
+            [InlineKeyboardButton(text="📋 Мой Watchlist", callback_data="manage_watchlist")],
+            [InlineKeyboardButton(text="🔙 Закрыть настройки", callback_data="close_settings")]
+        ]
+    )
+    return keyboard
+
+def get_advisory_approval_menu(symbol: str, side: str, amount: float):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"exec_{side}_{symbol}_{amount}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data="exec_reject")
+            ]
         ]
     )
     return keyboard
