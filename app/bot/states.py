@@ -9,3 +9,7 @@ class ExchangeAuth(StatesGroup):
 class StrategyConfig(StatesGroup):
     waiting_for_strategy = State()
     waiting_for_risk_pct = State()
+
+class LLMAuth(StatesGroup):
+    waiting_for_provider_name = State()
+    waiting_for_api_key = State()

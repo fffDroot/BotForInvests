@@ -5,10 +5,12 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy import select
 import json
 
-from .keyboards import get_main_menu, get_settings_menu, get_exchange_menu, get_strategies_menu
-from .states import ExchangeAuth, StrategyConfig
+from .keyboards import get_main_menu, get_settings_menu, get_exchange_menu, get_strategies_menu, get_ai_menu
+from .states import ExchangeAuth, StrategyConfig, LLMAuth
 from app.db.database import AsyncSessionLocal
-from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory
+from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory, LLMAPIKey
+from app.strategies.news import NewsAnalyzer
+from app.strategies.llm_council import LLMCouncil
 
 router = Router()
 
@@ -39,6 +41,10 @@ async def start_cmd(message: Message):
 @router.message(F.text == "⚙️ Настройки")
 async def settings_menu(message: Message):
     await message.answer("Меню настроек:", reply_markup=get_settings_menu())
+
+@router.callback_query(F.data == "back_to_settings")
+async def back_to_settings(callback: CallbackQuery):
+    await callback.message.edit_text("Меню настроек:", reply_markup=get_settings_menu())
 
 @router.callback_query(F.data == "add_api_keys")
 async def add_api_keys_start(callback: CallbackQuery, state: FSMContext):
@@ -219,6 +225,91 @@ async def show_history(message: Message):
         history_text += f"Стратегия: {t.strategy_used}\n\n"
 
     await message.answer(history_text, parse_mode="Markdown")
+
+@router.callback_query(F.data == "config_ai")
+async def config_ai_menu(callback: CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+        await callback.message.edit_text(
+            "Настройки ИИ и Консилиума.\nКонсилиум использует подключенные LLM модели для анализа новостей.",
+            reply_markup=get_ai_menu(settings.use_llm_council)
+        )
+
+@router.callback_query(F.data == "toggle_council")
+async def toggle_council(callback: CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+        settings.use_llm_council = not settings.use_llm_council
+        await session.commit()
+        await callback.message.edit_reply_markup(reply_markup=get_ai_menu(settings.use_llm_council))
+
+@router.callback_query(F.data == "add_llm_key")
+async def add_llm_key_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("Введите название провайдера (например, openai, anthropic, deepseek):")
+    await state.set_state(LLMAuth.waiting_for_provider_name)
+
+@router.message(LLMAuth.waiting_for_provider_name)
+async def process_llm_provider(message: Message, state: FSMContext):
+    provider = message.text.lower().strip()
+    await state.update_data(provider=provider)
+    await message.answer(f"Отлично. Отправьте ваш API KEY для {provider}:")
+    await state.set_state(LLMAuth.waiting_for_api_key)
+
+@router.message(LLMAuth.waiting_for_api_key)
+async def process_llm_api_key(message: Message, state: FSMContext):
+    data = await state.get_data()
+    api_key = message.text.strip()
+    provider = data['provider']
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+
+        old_key = await session.scalar(select(LLMAPIKey).where(
+            LLMAPIKey.user_id == user.id,
+            LLMAPIKey.provider_name == provider
+        ))
+        if old_key:
+            await session.delete(old_key)
+
+        new_key = LLMAPIKey(user_id=user.id, provider_name=provider, api_key=api_key)
+        session.add(new_key)
+        await session.commit()
+
+    await message.answer(f"✅ Ключ для LLM {provider} успешно сохранен!")
+    await state.clear()
+
+@router.message(F.text == "🌍 Анализ рынка и мира")
+async def analyze_world(message: Message):
+    await message.answer("⏳ Собираю свежие новости и анализирую мировой фон...")
+
+    analyzer = NewsAnalyzer()
+    news = analyzer.fetch_latest_news(limit=10)
+    news_text = "\n".join(news)
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+
+        if settings.use_llm_council:
+            llm_keys = await session.execute(select(LLMAPIKey).where(LLMAPIKey.user_id == user.id))
+            keys_list = [{"provider": k.provider_name, "key": k.api_key} for k in llm_keys.scalars().all()]
+
+            council = LLMCouncil(keys_list)
+            decision = await council.get_council_decision(news_text)
+
+            text = f"🌍 **Глобальный фон (Консилиум ИИ)**\n"
+            text += f"**Сентимент:** {decision['sentiment'].upper()} (Score: {decision['score']:.2f})\n"
+            text += f"**Количество моделей:** {decision['council_size']}\n\n"
+            text += f"{decision['reasoning']}\n\n"
+        else:
+            baseline = analyzer.analyze_sentiment(news)
+            text = f"🌍 **Глобальный фон (Базовый NLP)**\n"
+            text += f"**Сентимент:** {baseline['label'].upper()} (Score: {baseline['score']:.2f})\n"
+            text += f"{baseline['summary']}\n\n"
+
+    await message.answer(text, parse_mode="Markdown")
 
 @router.message(F.text == "ℹ️ Рекомендации/Инфо")
 async def show_info(message: Message):

@@ -3,6 +3,38 @@ import ta
 
 class MarketAnalyzer:
     @staticmethod
+    def get_comprehensive_technical_analysis(df: pd.DataFrame) -> dict:
+        """
+        Returns a dict of indicators: RSI, Bollinger Bands, Volume trend, MACD.
+        """
+        if df.empty or len(df) < 50:
+            return {"status": "insufficient_data"}
+
+        rsi = ta.momentum.RSIIndicator(df['close'], window=14).rsi().iloc[-1]
+
+        bb = ta.volatility.BollingerBands(df['close'], window=20, window_dev=2)
+        bb_high = bb.bollinger_hband().iloc[-1]
+        bb_low = bb.bollinger_lband().iloc[-1]
+        current_price = df['close'].iloc[-1]
+
+        macd = ta.trend.MACD(df['close'])
+        macd_line = macd.macd().iloc[-1]
+        macd_signal = macd.macd_signal().iloc[-1]
+
+        # Determine signals
+        rsi_signal = "oversold" if rsi < 30 else ("overbought" if rsi > 70 else "neutral")
+        bb_signal = "lower_band" if current_price <= bb_low else ("upper_band" if current_price >= bb_high else "middle")
+        macd_signal_str = "bullish" if macd_line > macd_signal else "bearish"
+
+        return {
+            "status": "ok",
+            "rsi": rsi,
+            "rsi_signal": rsi_signal,
+            "bb_signal": bb_signal,
+            "macd_signal": macd_signal_str
+        }
+
+    @staticmethod
     def determine_market_phase(df: pd.DataFrame) -> str:
         """
         Determines market phase: 'trending' or 'ranging' (flat).
