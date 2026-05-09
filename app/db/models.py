@@ -13,8 +13,20 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     api_keys = relationship("ExchangeAPIKey", back_populates="user", cascade="all, delete")
+    llm_keys = relationship("LLMAPIKey", back_populates="user", cascade="all, delete")
     settings = relationship("TradingSettings", back_populates="user", uselist=False, cascade="all, delete")
     trades = relationship("TradeHistory", back_populates="user", cascade="all, delete")
+
+class LLMAPIKey(Base):
+    __tablename__ = "llm_api_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    provider_name = Column(String) # openai, anthropic, deepseek, groq, gemini, etc.
+    api_key = Column(String)
+    is_active = Column(Boolean, default=True)
+
+    user = relationship("User", back_populates="llm_keys")
 
 class ExchangeAPIKey(Base):
     __tablename__ = "exchange_api_keys"
@@ -45,6 +57,9 @@ class TradingSettings(Base):
 
     # Optional JSON field for strategy specific settings (e.g. grid spacing)
     strategy_params = Column(JSON, nullable=True)
+
+    # AI and Council Settings
+    use_llm_council = Column(Boolean, default=False)
 
     user = relationship("User", back_populates="settings")
 

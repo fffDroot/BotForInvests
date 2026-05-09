@@ -2,9 +2,11 @@ import asyncio
 import logging
 from sqlalchemy import select
 from app.db.database import AsyncSessionLocal
-from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory
+from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory, LLMAPIKey
 from app.exchanges.factory import get_exchange_wrapper
 from app.strategies.factory import get_strategy
+from app.strategies.news import NewsAnalyzer
+from app.strategies.llm_council import LLMCouncil
 from app.bot.config import bot
 
 logger = logging.getLogger(__name__)
@@ -17,7 +19,10 @@ class TradingEngine:
         self.is_running = True
         logger.info("Trading engine started.")
         while self.is_running:
-            await self._run_cycle()
+            try:
+                await self._run_cycle()
+            except Exception as e:
+                logger.error(f"Error in engine cycle: {e}")
             await asyncio.sleep(60) # Run every minute
 
     async def stop(self):
@@ -33,6 +38,24 @@ class TradingEngine:
             for settings in active_settings_list:
                 await self._process_user(session, settings)
 
+    async def _get_global_sentiment(self, session, user: User, settings: TradingSettings) -> str:
+        """Returns 'positive', 'neutral', or 'negative' based on News/LLM Council"""
+        analyzer = NewsAnalyzer()
+        news = analyzer.fetch_latest_news(limit=10)
+
+        if settings.use_llm_council:
+            llm_keys = await session.execute(select(LLMAPIKey).where(LLMAPIKey.user_id == user.id))
+            keys_list = [{"provider": k.provider_name, "key": k.api_key} for k in llm_keys.scalars().all()]
+            if keys_list:
+                council = LLMCouncil(keys_list)
+                news_text = "\n".join(news)
+                decision = await council.get_council_decision(news_text)
+                return decision.get('sentiment', 'neutral')
+
+        # Fallback to baseline
+        baseline = analyzer.analyze_sentiment(news)
+        return baseline.get('label', 'neutral')
+
     async def _process_user(self, session, settings: TradingSettings):
         user = await session.scalar(select(User).where(User.id == settings.user_id))
         api_keys = await session.execute(select(ExchangeAPIKey).where(ExchangeAPIKey.user_id == user.id))
@@ -41,13 +64,16 @@ class TradingEngine:
         if not api_keys:
             return # No keys to trade with
 
+        # Get global sentiment once per user cycle
+        global_sentiment = await self._get_global_sentiment(session, user, settings)
+
         for api_key_info in api_keys:
             try:
-                await self._trade_on_exchange(session, user, settings, api_key_info)
+                await self._trade_on_exchange(session, user, settings, api_key_info, global_sentiment)
             except Exception as e:
                 logger.error(f"Error trading for user {user.id} on {api_key_info.exchange_name}: {e}")
 
-    async def _trade_on_exchange(self, session, user: User, settings: TradingSettings, api_key_info: ExchangeAPIKey):
+    async def _trade_on_exchange(self, session, user: User, settings: TradingSettings, api_key_info: ExchangeAPIKey, global_sentiment: str):
         exchange = get_exchange_wrapper(
             exchange_name=api_key_info.exchange_name,
             api_key=api_key_info.api_key,
@@ -82,8 +108,18 @@ class TradingEngine:
         current_position = balances.get(base_asset, 0.0)
         quote_balance = balances.get(quote_asset, 0.0)
 
-        # 4. Generate Signal
+        # 4. Synthesize signals with global sentiment
+        # Do not buy if world is crashing
         signal = strategy.generate_signal(df, current_position)
+
+        if signal and signal['action'] == 'buy' and global_sentiment == 'negative':
+            logger.info(f"Skipping BUY for {user.id} on {symbol} due to negative global sentiment.")
+            signal = None # Suppress buy signal
+
+        # Optional: Panic sell if world is crashing and we hold positions
+        if current_position > 0 and global_sentiment == 'negative' and not signal:
+            logger.info(f"Generating panic SELL for {user.id} on {symbol} due to negative global sentiment.")
+            signal = {'action': 'sell', 'reason': 'Global negative sentiment (Panic Sell)', 'size_pct': 100.0}
 
         if signal:
             await self._execute_signal(session, user, settings, exchange, symbol, signal, current_position, quote_balance)

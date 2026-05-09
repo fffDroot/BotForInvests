@@ -6,3 +6,6 @@ asyncpg>=0.29.0
 pandas>=2.1.0
 ta>=0.11.0
 python-dotenv>=1.0.0
+feedparser>=6.0.10
+vaderSentiment>=3.3.2
+aiohttp>=3.9.0
