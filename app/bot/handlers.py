@@ -6,9 +6,9 @@ from sqlalchemy import select
 import json
 
 from .keyboards import get_main_menu, get_settings_menu, get_exchange_menu, get_strategies_menu, get_ai_menu
-from .states import ExchangeAuth, StrategyConfig, LLMAuth
+from .states import ExchangeAuth, StrategyConfig, LLMAuth, WatchlistConfig
 from app.db.database import AsyncSessionLocal
-from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory, LLMAPIKey
+from app.db.models import User, ExchangeAPIKey, TradingSettings, TradeHistory, LLMAPIKey, Watchlist
 from app.strategies.news import NewsAnalyzer
 from app.strategies.llm_council import LLMCouncil
 
@@ -40,11 +40,78 @@ async def start_cmd(message: Message):
 
 @router.message(F.text == "⚙️ Настройки")
 async def settings_menu(message: Message):
-    await message.answer("Меню настроек:", reply_markup=get_settings_menu())
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+        await message.answer("Меню настроек:", reply_markup=get_settings_menu(settings.trade_mode, settings.account_type))
 
 @router.callback_query(F.data == "back_to_settings")
 async def back_to_settings(callback: CallbackQuery):
-    await callback.message.edit_text("Меню настроек:", reply_markup=get_settings_menu())
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+        await callback.message.edit_text("Меню настроек:", reply_markup=get_settings_menu(settings.trade_mode, settings.account_type))
+
+@router.callback_query(F.data == "manage_watchlist")
+async def manage_watchlist(callback: CallbackQuery, state: FSMContext):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        watchlist_result = await session.execute(select(Watchlist).where(Watchlist.user_id == user.id))
+        watchlist = [w.symbol for w in watchlist_result.scalars().all()]
+
+    text = "📋 **Ваш Watchlist:**\n"
+    if watchlist:
+        text += "\n".join(f"- {s}" for s in watchlist)
+    else:
+        text += "Пусто. Бот будет искать монеты автоматически."
+
+    text += "\n\nОтправьте мне тикер, который хотите добавить или удалить (например, BTC/USDT или SBER):"
+
+    await callback.message.edit_text(text)
+    await state.set_state(WatchlistConfig.waiting_for_symbol)
+
+@router.message(WatchlistConfig.waiting_for_symbol)
+async def process_watchlist_symbol(message: Message, state: FSMContext):
+    symbol = message.text.upper().strip()
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+
+        existing = await session.scalar(select(Watchlist).where(Watchlist.user_id == user.id, Watchlist.symbol == symbol))
+        if existing:
+            await session.delete(existing)
+            action_text = f"🗑 Удалено: {symbol}"
+        else:
+            new_item = Watchlist(user_id=user.id, symbol=symbol, asset_type='auto')
+            session.add(new_item)
+            action_text = f"✅ Добавлено: {symbol}"
+
+        await session.commit()
+
+    await message.answer(action_text)
+    await state.clear()
+
+@router.callback_query(F.data == "close_settings")
+async def close_settings(callback: CallbackQuery):
+    await callback.message.delete()
+
+@router.callback_query(F.data == "toggle_trade_mode")
+async def toggle_trade_mode(callback: CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+        settings.trade_mode = "auto" if settings.trade_mode == "advisory" else "advisory"
+        await session.commit()
+        await callback.message.edit_reply_markup(reply_markup=get_settings_menu(settings.trade_mode, settings.account_type))
+
+@router.callback_query(F.data == "toggle_account_type")
+async def toggle_account_type(callback: CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+        settings.account_type = "real" if settings.account_type == "paper" else "paper"
+        await session.commit()
+        await callback.message.edit_reply_markup(reply_markup=get_settings_menu(settings.trade_mode, settings.account_type))
 
 @router.callback_query(F.data == "add_api_keys")
 async def add_api_keys_start(callback: CallbackQuery, state: FSMContext):
@@ -172,34 +239,69 @@ async def stop_trading(message: Message):
 async def show_portfolio(message: Message):
     async with AsyncSessionLocal() as session:
         user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
         api_keys = await session.execute(select(ExchangeAPIKey).where(ExchangeAPIKey.user_id == user.id))
         api_keys = api_keys.scalars().all()
 
-    if not api_keys:
+    if not api_keys and settings.account_type != 'paper':
         await message.answer("Сначала добавьте API ключи бирж в настройках.")
         return
 
     await message.answer("⏳ Собираю информацию по балансам...")
     from app.exchanges.factory import get_exchange_wrapper
+    from app.exchanges.paper import PaperTradingExchangeWrapper
 
-    portfolio_text = "📊 **Ваш портфель:**\n\n"
-    for key in api_keys:
-        try:
-            exchange = get_exchange_wrapper(key.exchange_name, key.api_key, key.api_secret, key.passphrase)
-            balances = await exchange.get_balance()
-            await exchange.close()
+    portfolio_text = f"📊 **Ваш портфель ({'Виртуальный' if settings.account_type == 'paper' else 'Реальный'}):**\n\n"
 
-            portfolio_text += f"🏛 **{key.exchange_name.upper()}**:\n"
-            has_funds = False
-            for asset, amount in balances.items():
-                if amount > 0: # Simple threshold
-                    portfolio_text += f"🔹 {asset}: {amount:.4f}\n"
-                    has_funds = True
-            if not has_funds:
-                portfolio_text += "Пусто\n"
-            portfolio_text += "\n"
-        except Exception as e:
-            portfolio_text += f"🏛 **{key.exchange_name.upper()}**: Ошибка получения ({e})\n\n"
+    # Initial mock balances for paper trading
+    INITIAL_USDT = 10000.0
+    total_usdt_value = 0.0
+
+    if settings.account_type == 'paper':
+        exchange = PaperTradingExchangeWrapper(user_id=user.id)
+        balances = await exchange.get_balance()
+        portfolio_text += f"🏛 **Paper Wallet**:\n"
+        has_funds = False
+
+        for asset, amount in balances.items():
+            if amount > 0:
+                portfolio_text += f"🔹 {asset}: {amount:.4f}\n"
+                has_funds = True
+                if asset == 'USDT':
+                    total_usdt_value += amount
+                elif asset != 'RUB':
+                    # Rough PnL calculation: convert asset back to USDT
+                    df = await exchange.get_ohlcv(f"{asset}/USDT", limit=1)
+                    if df is not None and not df.empty:
+                        price = df['close'].iloc[-1]
+                        total_usdt_value += amount * price
+
+        if not has_funds:
+            portfolio_text += "Пусто\n"
+
+        # PnL logic for Paper
+        pnl = total_usdt_value - INITIAL_USDT
+        pnl_pct = (pnl / INITIAL_USDT) * 100
+        emoji = "📈" if pnl >= 0 else "📉"
+        portfolio_text += f"\n{emoji} **Прибыль/Убыток (PnL):** {pnl:.2f} USDT ({pnl_pct:.2f}%)\n"
+    else:
+        for key in api_keys:
+            try:
+                exchange = get_exchange_wrapper(key.exchange_name, key.api_key, key.api_secret, key.passphrase)
+                balances = await exchange.get_balance()
+                await exchange.close()
+
+                portfolio_text += f"🏛 **{key.exchange_name.upper()}**:\n"
+                has_funds = False
+                for asset, amount in balances.items():
+                    if amount > 0: # Simple threshold
+                        portfolio_text += f"🔹 {asset}: {amount:.4f}\n"
+                        has_funds = True
+                if not has_funds:
+                    portfolio_text += "Пусто\n"
+                portfolio_text += "\n"
+            except Exception as e:
+                portfolio_text += f"🏛 **{key.exchange_name.upper()}**: Ошибка получения ({e})\n\n"
 
     await message.answer(portfolio_text, parse_mode="Markdown")
 
@@ -225,6 +327,58 @@ async def show_history(message: Message):
         history_text += f"Стратегия: {t.strategy_used}\n\n"
 
     await message.answer(history_text, parse_mode="Markdown")
+
+@router.callback_query(F.data.startswith("exec_"))
+async def execute_advisory_trade(callback: CallbackQuery):
+    action_data = callback.data.split("_")
+
+    if action_data[1] == "reject":
+        await callback.message.edit_text(callback.message.text + "\n\n❌ **Отклонено пользователем.**")
+        return
+
+    side = action_data[1]
+    symbol = action_data[2]
+    size_pct = float(action_data[3])
+
+    await callback.message.edit_text(callback.message.text + "\n\n⏳ **Выполняю...**")
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == callback.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+        api_key_info = await session.scalar(select(ExchangeAPIKey).where(ExchangeAPIKey.user_id == user.id)) # Simplified for demo, grabs first key
+
+        if not api_key_info:
+            await callback.message.edit_text("❌ Ошибка: нет API ключей.")
+            return
+
+        from app.core.engine import engine
+        from app.exchanges.paper import PaperTradingExchangeWrapper
+        from app.exchanges.factory import get_exchange_wrapper
+
+        if settings.account_type == "paper":
+            exchange = PaperTradingExchangeWrapper(user_id=user.id, mock_exchange_name=api_key_info.exchange_name)
+        else:
+            exchange = get_exchange_wrapper(
+                exchange_name=api_key_info.exchange_name,
+                api_key=api_key_info.api_key,
+                api_secret=api_key_info.api_secret,
+                passphrase=api_key_info.passphrase
+            )
+
+        balances = await exchange.get_balance()
+        base_asset = symbol.split('/')[0] if '/' in symbol else symbol
+        quote_asset = symbol.split('/')[1] if '/' in symbol else 'USDT'
+
+        current_position = balances.get(base_asset, 0.0)
+        quote_balance = balances.get(quote_asset, 0.0)
+
+        signal = {'action': side, 'size_pct': size_pct * 100, 'reason': 'Manual Advisory Approval'}
+
+        # Execute manually via engine's method
+        await engine._execute_signal(session, user, settings, exchange, symbol, signal, current_position, quote_balance)
+        await exchange.close()
+
+    await callback.message.edit_text(callback.message.text.replace("⏳ **Выполняю...**", "✅ **Сделка отправлена на биржу!**"))
 
 @router.callback_query(F.data == "config_ai")
 async def config_ai_menu(callback: CallbackQuery):
@@ -280,6 +434,56 @@ async def process_llm_api_key(message: Message, state: FSMContext):
     await message.answer(f"✅ Ключ для LLM {provider} успешно сохранен!")
     await state.clear()
 
+@router.message(Command("rebalance"))
+async def rebalance_portfolio(message: Message):
+    await message.answer("⚖️ Начинаю анализ портфеля для ребалансировки...")
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+        api_keys = await session.execute(select(ExchangeAPIKey).where(ExchangeAPIKey.user_id == user.id))
+        api_keys = api_keys.scalars().all()
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+
+        if not api_keys and settings.account_type != "paper":
+            await message.answer("Нет подключенных бирж.")
+            return
+
+        from app.exchanges.factory import get_exchange_wrapper
+        from app.exchanges.paper import PaperTradingExchangeWrapper
+
+        portfolio_str = ""
+
+        if settings.account_type == "paper":
+            exchange = PaperTradingExchangeWrapper(user_id=user.id, mock_exchange_name='paper')
+            balances = await exchange.get_balance()
+            portfolio_str += f"Paper Wallet: {balances}\n"
+        else:
+            for key in api_keys:
+                try:
+                    exchange = get_exchange_wrapper(key.exchange_name, key.api_key, key.api_secret, key.passphrase)
+                    balances = await exchange.get_balance()
+                    await exchange.close()
+                    non_zero = {k: v for k, v in balances.items() if v > 0}
+                    portfolio_str += f"{key.exchange_name}: {non_zero}\n"
+                except Exception:
+                    pass
+
+        analyzer = NewsAnalyzer()
+        news = analyzer.fetch_latest_news(limit=5)
+        news_text = "\n".join(news)
+
+        if settings.use_llm_council:
+            llm_keys = await session.execute(select(LLMAPIKey).where(LLMAPIKey.user_id == user.id))
+            keys_list = [{"provider": k.provider_name, "key": k.api_key} for k in llm_keys.scalars().all()]
+            if keys_list:
+                council = LLMCouncil(keys_list)
+                prompt = f"Мой текущий портфель: {portfolio_str}. Текущие мировые новости: {news_text}. Предложи конкретные шаги по ребалансировке с учетом рисков."
+                decision = await council.get_council_decision(prompt)
+
+                await message.answer(f"⚖️ **План Ребалансировки (ИИ Консилиум)**\n\nСентимент: {decision['sentiment'].upper()}\n\nРекомендации:\n{decision['reasoning']}", parse_mode="Markdown")
+                return
+
+        await message.answer("Консилиум ИИ выключен или нет ключей. Для умной ребалансировки включите LLM в настройках.")
+
 @router.message(F.text == "🌍 Анализ рынка и мира")
 async def analyze_world(message: Message):
     await message.answer("⏳ Собираю свежие новости и анализирую мировой фон...")
@@ -311,9 +515,71 @@ async def analyze_world(message: Message):
 
     await message.answer(text, parse_mode="Markdown")
 
+@router.message(F.text.regexp(r"^[A-Z0-9]+(/[A-Z0-9]+)?$"))
+async def deep_dive_analysis(message: Message):
+    symbol = message.text.upper()
+    await message.answer(f"🔍 Начинаю глубокий анализ актива **{symbol}**...")
+
+    from app.exchanges.factory import get_exchange_wrapper
+    from app.strategies.analyzer import MarketAnalyzer
+
+    # We need to fetch OHLCV. Use paper exchange for anonymous public fetch
+    from app.exchanges.paper import PaperTradingExchangeWrapper
+
+    exchange = PaperTradingExchangeWrapper(user_id=message.from_user.id, mock_exchange_name='binance')
+    df = await exchange.get_ohlcv(symbol, timeframe='1d', limit=100)
+
+    if df is None or df.empty:
+        await message.answer(f"❌ Не удалось получить данные графика для {symbol}. Проверьте правильность тикера.")
+        return
+
+    tech_analysis = MarketAnalyzer.get_comprehensive_technical_analysis(df)
+    trend = MarketAnalyzer.determine_market_phase(df)
+
+    current_price = df['close'].iloc[-1]
+
+    # News and AI Council
+    analyzer = NewsAnalyzer()
+    news = analyzer.fetch_latest_news(limit=5)
+
+    # Simulate adding specific ticker to news query conceptually (in a real app, feed parser would be queried specifically)
+    news.append(f"Анализ актива {symbol} показывает текущую цену {current_price}.")
+
+    news_text = "\n".join(news)
+
+    async with AsyncSessionLocal() as session:
+        user = await session.scalar(select(User).where(User.telegram_id == message.from_user.id))
+        settings = await session.scalar(select(TradingSettings).where(TradingSettings.user_id == user.id))
+
+        council_text = ""
+        if settings.use_llm_council:
+            llm_keys = await session.execute(select(LLMAPIKey).where(LLMAPIKey.user_id == user.id))
+            keys_list = [{"provider": k.provider_name, "key": k.api_key} for k in llm_keys.scalars().all()]
+
+            if keys_list:
+                council = LLMCouncil(keys_list)
+                # Specific prompt for asset
+                decision = await council.get_council_decision(f"Проанализируй перспективы {symbol}. Текущие новости: {news_text}")
+                council_text = f"\n🧠 **Мнение ИИ Консилиума:**\nСентимент: {decision['sentiment'].upper()}\nОбоснование:\n{decision['reasoning']}\n"
+
+    report = f"📊 **Глубокий анализ {symbol}**\n\n" \
+             f"**Текущая цена:** {current_price:.4f}\n" \
+             f"**Тренд:** {trend.upper()}\n" \
+             f"**RSI:** {tech_analysis.get('rsi', 0):.2f} ({tech_analysis.get('rsi_signal', 'unknown')})\n" \
+             f"**MACD Signal:** {tech_analysis.get('macd_signal', 'unknown')}\n" \
+             f"**Полосы Боллинджера:** {tech_analysis.get('bb_signal', 'unknown')}\n"
+
+    if council_text:
+        report += council_text
+
+    await message.answer(report, parse_mode="Markdown")
+
 @router.message(F.text == "ℹ️ Рекомендации/Инфо")
 async def show_info(message: Message):
     info_text = (
+        "📚 **Инструкция и возможности:**\n\n"
+        "🔸 **Глубокий анализ:** Просто отправьте тикер (например, `BTC/USDT` или `AAPL`), и бот проведет его глубокий анализ через ИИ Консилиум и индикаторы.\n"
+        "🔸 **Ребалансировка:** Отправьте команду `/rebalance`, чтобы ИИ проанализировал ваш портфель и дал советы по перераспределению средств.\n\n"
         "📚 **Справка по стратегиям:**\n\n"
         "🔹 **Автоматическая**: Бот анализирует рынок (трендовые индикаторы ADX/MACD) и сам выбирает "
         "лучшую стратегию. Идеально для пассивного инвестирования.\n\n"

@@ -45,11 +45,53 @@ class OpenAIProvider(LLMProvider):
                 logger.error(f"OpenAI connection error: {e}")
         return None
 
-# Mapping names to classes
+class OpenAICompatibleProvider(LLMProvider):
+    def __init__(self, url: str, model: str):
+        self.url = url
+        self.model = model
+
+    async def analyze(self, api_key: str, news_text: str) -> Dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        prompt = f"Ты финансовый аналитик. Прочитай следующие мировые новости и ответь СТРОГО в формате JSON: {{\"sentiment\": \"positive\" | \"negative\" | \"neutral\", \"confidence\": от 0.0 до 1.0, \"reasoning\": \"краткое объяснение\"}}. Новости: {news_text}"
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3
+        }
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(self.url, headers=headers, json=payload, timeout=15) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        content = data['choices'][0]['message']['content']
+                        import json
+                        try:
+                            start_idx = content.find('{')
+                            end_idx = content.rfind('}') + 1
+                            if start_idx != -1 and end_idx != -1:
+                                return json.loads(content[start_idx:end_idx])
+                        except json.JSONDecodeError:
+                            pass
+                        return {"sentiment": "neutral", "confidence": 0.5, "reasoning": "Failed to parse JSON."}
+                    else:
+                        logger.error(f"LLM API error ({self.url}): {await resp.text()}")
+            except Exception as e:
+                logger.error(f"LLM Connection error ({self.url}): {e}")
+        return None
+
+# Mapping names to instances of providers
 PROVIDERS = {
-    "openai": OpenAIProvider,
-    # Adding more providers is easy by subclassing LLMProvider.
-    # For MVP we implement OpenAI style. Groq/DeepSeek often use OpenAI-compatible endpoints.
+    "openai": OpenAICompatibleProvider("https://api.openai.com/v1/chat/completions", "gpt-3.5-turbo"),
+    "deepseek": OpenAICompatibleProvider("https://api.deepseek.com/v1/chat/completions", "deepseek-chat"),
+    "groq": OpenAICompatibleProvider("https://api.groq.com/openai/v1/chat/completions", "llama3-70b-8192"),
+    # Anthropic, Gemini and others require slightly different formats,
+    # but many gateways exist. For MVP, we route them through standard wrappers if needed,
+    # or treat them as OpenAI compatible if user uses a proxy (like OpenRouter).
+    "openrouter": OpenAICompatibleProvider("https://openrouter.ai/api/v1/chat/completions", "anthropic/claude-3-haiku"),
 }
 
 class LLMCouncil:
@@ -68,13 +110,15 @@ class LLMCouncil:
         for key_info in self.api_keys:
             provider_name = key_info['provider'].lower()
             if provider_name in PROVIDERS:
-                provider_inst = PROVIDERS[provider_name]()
+                provider_inst = PROVIDERS[provider_name]
                 tasks.append(provider_inst.analyze(key_info['key'], news_text))
                 providers_used.append(provider_name)
             else:
-                # Mock fallback for unknown providers pretending to be OpenAI compatible
-                # In real scenario we'd define them.
-                pass
+                # Fallback: assume user provided a custom base URL as provider name,
+                # or just fallback to openrouter as a generic OpenAI compatible endpoint
+                provider_inst = OpenAICompatibleProvider("https://openrouter.ai/api/v1/chat/completions", "auto")
+                tasks.append(provider_inst.analyze(key_info['key'], news_text))
+                providers_used.append("custom_" + provider_name)
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
