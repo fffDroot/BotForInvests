@@ -95,11 +95,23 @@ PROVIDERS = {
 }
 
 class LLMCouncil:
-    def __init__(self, api_keys: List[Dict[str, str]]):
+    def __init__(self, api_keys: List[Dict[str, str]], council_mode: str = "classic"):
         """
-        api_keys format: [{'provider': 'openai', 'key': 'sk-...'}, ...]
+        api_keys format: [{'provider': 'openai', 'key': 'sk-...', 'role': 'general'}, ...]
         """
         self.api_keys = api_keys
+        self.council_mode = council_mode
+
+    def _build_prompt_for_role(self, role: str, context: str) -> str:
+        base = "Ответь СТРОГО в формате JSON: {\"sentiment\": \"positive\" | \"negative\" | \"neutral\", \"confidence\": от 0.0 до 1.0, \"reasoning\": \"объяснение\"}."
+        if role == "fundamental":
+            return f"Ты Макроэкономист и Фундаментальный аналитик. Проанализируй новости и календарь событий. {base} Данные: {context}"
+        elif role == "technical":
+            return f"Ты Технический Трейдер. Оцени графики, объемы и ончейн-китов. Игнорируй шум. {base} Данные: {context}"
+        elif role == "risk":
+            return f"Ты Риск-менеджер. Твоя задача искать скрытые угрозы, панику в соцсетях и защищать капитал. Занижай оценки при риске. {base} Данные: {context}"
+        else:
+            return f"Ты финансовый аналитик. Прочитай следующие мировые новости и сделай вывод. {base} Данные: {context}"
 
     async def get_council_decision(self, news_text: str) -> Dict[str, Any]:
         if not self.api_keys:
@@ -107,18 +119,56 @@ class LLMCouncil:
 
         tasks = []
         providers_used = []
+        roles_used = []
+
         for key_info in self.api_keys:
             provider_name = key_info['provider'].lower()
+            role = key_info.get('role', 'general') if self.council_mode == "role_based" else "general"
+            custom_prompt = self._build_prompt_for_role(role, news_text)
+
+            # Since LLMProvider.analyze currently hardcodes the prompt, we inject it dynamically.
+            # We wrap the call to dynamically pass the custom prompt to the provider instances.
             if provider_name in PROVIDERS:
                 provider_inst = PROVIDERS[provider_name]
-                tasks.append(provider_inst.analyze(key_info['key'], news_text))
-                providers_used.append(provider_name)
             else:
-                # Fallback: assume user provided a custom base URL as provider name,
-                # or just fallback to openrouter as a generic OpenAI compatible endpoint
                 provider_inst = OpenAICompatibleProvider("https://openrouter.ai/api/v1/chat/completions", "auto")
-                tasks.append(provider_inst.analyze(key_info['key'], news_text))
-                providers_used.append("custom_" + provider_name)
+
+            # Monkeypatch the prompt for this specific call
+            async def wrapped_analyze(inst, k, txt, prpt):
+                # Temporary override just for flexibility in MVP
+                original_analyze = inst.analyze
+                async def custom_analyze(api_key, text):
+                    # We reimplement the request body here to allow custom prompt
+                    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                    payload = {
+                        "model": getattr(inst, 'model', 'gpt-3.5-turbo'),
+                        "messages": [{"role": "user", "content": prpt}],
+                        "temperature": 0.3
+                    }
+                    url = getattr(inst, 'url', "https://api.openai.com/v1/chat/completions")
+                    async with aiohttp.ClientSession() as session:
+                        try:
+                            async with session.post(url, headers=headers, json=payload, timeout=15) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    content = data['choices'][0]['message']['content']
+                                    import json
+                                    try:
+                                        start_idx = content.find('{')
+                                        end_idx = content.rfind('}') + 1
+                                        if start_idx != -1 and end_idx != -1:
+                                            return json.loads(content[start_idx:end_idx])
+                                    except json.JSONDecodeError:
+                                        pass
+                                    return {"sentiment": "neutral", "confidence": 0.5, "reasoning": "Failed to parse JSON."}
+                        except Exception as e:
+                            pass
+                    return {"sentiment": "neutral", "confidence": 0.0, "reasoning": "Error"}
+                return await custom_analyze(k, txt)
+
+            tasks.append(wrapped_analyze(provider_inst, key_info['key'], news_text, custom_prompt))
+            providers_used.append(provider_name)
+            roles_used.append(role)
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -128,6 +178,7 @@ class LLMCouncil:
                  logger.error(f"Provider failed: {res}")
             else:
                  res['provider'] = providers_used[i]
+                 res['role'] = roles_used[i]
                  valid_results.append(res)
 
         if not valid_results:
@@ -138,16 +189,21 @@ class LLMCouncil:
         total_score = 0.0
         total_confidence = 0.0
 
-        council_reasoning = "Консилиум решил:\n"
+        council_reasoning = f"Консилиум ({self.council_mode}) решил:\n"
 
         for res in valid_results:
             sent = res.get('sentiment', 'neutral')
             conf = float(res.get('confidence', 0.5))
             val = sentiment_scores.get(sent, 0.0)
 
+            # Risk manager has double weight in negative scenarios
+            if res['role'] == 'risk' and sent == 'negative':
+                conf *= 2.0
+
             total_score += val * conf
             total_confidence += conf
-            council_reasoning += f"- {res['provider'].upper()}: {sent} (уверенность {conf}). Причина: {res.get('reasoning', '')}\n"
+            role_badge = f"[{res['role'].upper()}]" if self.council_mode == "role_based" else ""
+            council_reasoning += f"- {role_badge} {res['provider'].upper()}: {sent} (уверенность {conf}). Причина: {res.get('reasoning', '')}\n"
 
         avg_score = total_score / total_confidence if total_confidence > 0 else 0.0
 

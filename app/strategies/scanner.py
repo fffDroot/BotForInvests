@@ -32,3 +32,46 @@ class MarketScanner:
             return []
         finally:
             await exchange.close()
+
+    async def get_orderbook_and_funding(self, symbol: str) -> dict:
+        """
+        Fetches Orderbook Imbalance and Funding Rates (if applicable)
+        to predict short term price action.
+        """
+        exchange_class = getattr(ccxt, self.exchange_id)
+        exchange = exchange_class({'enableRateLimit': True})
+
+        result = {"orderbook_imbalance": "neutral", "funding_rate": "N/A", "open_interest": "N/A"}
+
+        try:
+            # 1. Orderbook Analysis
+            ob = await exchange.fetch_order_book(symbol, limit=50)
+            bids = sum([x[1] for x in ob['bids']]) # Total volume of buyers
+            asks = sum([x[1] for x in ob['asks']]) # Total volume of sellers
+
+            if bids > asks * 1.5:
+                result['orderbook_imbalance'] = "bullish (strong buy wall)"
+            elif asks > bids * 1.5:
+                result['orderbook_imbalance'] = "bearish (strong sell wall)"
+
+            # 2. Funding Rates / Futures Analysis (Only works on derivatives markets, wrapping in try/except)
+            if exchange.has.get('fetchFundingRate'):
+                try:
+                    funding = await exchange.fetch_funding_rate(symbol)
+                    rate = funding.get('fundingRate', 0)
+                    if rate is not None:
+                        if rate > 0.001: # High funding
+                            result['funding_rate'] = f"{rate:.4f} (High - Squeeze Risk)"
+                        elif rate < -0.001:
+                            result['funding_rate'] = f"{rate:.4f} (Negative - Short Squeeze Risk)"
+                        else:
+                            result['funding_rate'] = f"{rate:.4f} (Normal)"
+                except Exception:
+                    pass # Not all pairs/exchanges support this
+
+        except Exception as e:
+            logger.error(f"Error fetching orderbook/funding for {symbol}: {e}")
+        finally:
+            await exchange.close()
+
+        return result
